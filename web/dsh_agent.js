@@ -32,6 +32,8 @@ const S = {
   statusEl: null,
   lastAssistantEl: null,
   toolChips: new Map(),
+  // 刚由本机乐观渲染过的那句用户消息；服务端回显同一条时用它去重（否则面板里会出现两条一样的）
+  lastLocalSend: null,
   activeSession: "",
   sessions: [],
   trash: [],
@@ -329,7 +331,16 @@ async function applyPendingGraph(pending) {
 function handleEvent(ev) {
   switch (ev.kind) {
     case "user":
-      if (ev.text && ev.text.trim()) addMessage("user", ev.text);
+      if (ev.text && ev.text.trim()) {
+        const t = ev.text.trim();
+        const local = S.lastLocalSend;
+        if (local && local.text === t && Date.now() - local.at < 20000) {
+          // 这句就是我刚发出去的，本机已经渲染过一次，跳过回显
+          S.lastLocalSend = null;
+        } else {
+          addMessage("user", t);
+        }
+      }
       break;
     case "assistant":
       if (ev.text && ev.text.trim()) addMessage("assistant", ev.text);
@@ -448,6 +459,7 @@ function sendCurrent() {
   input.value = "";
   input.style.height = "";
   addMessage("user", text);
+  S.lastLocalSend = { text, at: Date.now() };
   setThinking(true);
   postJSON("/dsh/chat", { text, sessionId: S.activeSession || undefined }).then((data) => {
     if (!data.ok) {
