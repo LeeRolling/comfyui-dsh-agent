@@ -2,6 +2,39 @@
 
 首个公开版本基于原作者在 macOS 上的实现；本仓库在其之上补了 Windows 适配与面板上下文修复。
 
+## v0.2.0 — 2026-11-24
+
+### 新增：历史会话（多会话）
+
+- 新增 `dsh_store.py`：`index.json` 索引 + `sessions/<sessionId>.jsonl` 逐会话事件 + `trash/` 回收站，落盘在 `<ComfyUI>/user/default/dsh-agent/`。
+- 引擎改为多会话：每个会话独立缓冲事件（按 `sessionId` 分桶），切换时用 SDK 的 `session/resume` 接续（历史不重放，由本地 store 回放给 UI）。
+- 新路由：`GET /dsh/sessions`、`POST /dsh/session/{new,select,rename,trash,restore,purge}`；`/dsh/chat`、`/dsh/poll` 接受 `sessionId`。
+- 前端：头部「历史会话 (N) ▾」——标题（首条消息自动截断 24 字，可改名）· 条数 · 相对时间，当前项 ●；底部 `回收站 (N) ›`，恢复 / 彻底删除 / 清空回收站。
+- 重启 ComfyUI 后自动打开上次会话；多个会话可同时存在（切换时提示显存占用）。
+
+### 新增：授权卡 / 询问卡
+
+- `approval/request` 不再静默自动放行，改为卡片：工具名、callId 前 8 位、理由，三个按钮「允许一次 / 本会话总是允许 / 拒绝」。
+- 5 分钟未处理按 **拒绝** 结束；同会话发新消息时，挂起的旧授权卡按 **拒绝** 收尾。
+- `ask_user_question` 卡片在选项之外增加自定义输入（`custom`），支持只填答案不选选项。
+- 新路由：`POST /dsh/approve`、`POST /dsh/autonomy`（本会话自动放行开关）；`/dsh/status` 增加 `autoApprove`。
+
+### 修复：一轮对抗性代码审查发现的问题
+
+- **critical** `_ready_event` 只 set 不 clear：runtime 崩过一次后，之后每次 `ensure_started()` 都秒抛「启动失败」；且不清理旧进程可能同时跑两个 runtime。→ 启动前 `clear()`，`_spawn_locked()` 先终止旧进程。
+- **critical** 会话存储无锁 + 固定临时文件名：并发写会把 `index.json` 写坏，下次加载静默变空索引（历史"消失"）。→ `RLock` 全程保护、`mkstemp` 唯一临时名 + `fsync` + `os.replace`、索引损坏时备份并从 `sessions/*.jsonl` 重建。
+- **high** `sessionId` 未校验直接拼路径（`../`、绝对路径可逃逸）→ 白名单 `^comfyui-[A-Za-z0-9_-]{1,64}$`。
+- **high** 发新消息会把挂起授权自动 `allowed-once`（等于替你点了允许）→ 改为 `rejected`。
+- **high** `/dsh/*` 无 Host/Origin 校验、`/dsh/approve` 缺 `outcome` 默认放行、`purge` 可越过回收站 → 19 个路由统一 loopback 守卫、`outcome` 必填、`purge` 必须带 id 或显式 `{"all": true}`。
+- **medium** 轮询无在途去重且串会话、坏图不 ack 导致每 700ms 重投、卡片关闭选择器注入、菜单键盘不可达 → 一并修掉；`turn/start` 时重置 `turn_had_text`，`session/title` 截掉注入的 `<comfy_context>`。
+
+### 验证
+
+- `py_compile` ×4、`node --check`；会话接口全链路（new/select/rename/trash/restore/purge + 无 id purge → 400）。
+- 真实对话：`user → status → title → assistant → status`；重启后历史仍可回放并继续对话。
+- 守卫：`Origin: http://evil.example` → 403；裸 socket `Host: evil.example:8188` → 403，`Host: 127.0.0.1:8188` → 200。
+- 授权卡 E2E（`plugin_manager` 触发）、本会话自动放行、询问卡自定义输入、无头 Edge + CDP 面板 DOM 断言（历史菜单与卡片按钮）。
+
 ## v0.1.0 — 2026-11-22
 
 首个公开版本（Windows 实机验证 + macOS 路径保留）。

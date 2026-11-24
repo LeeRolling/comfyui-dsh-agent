@@ -23,10 +23,20 @@
 | 需求 | 实现 |
 | --- | --- |
 | 在 ComfyUI 里和 agent 对话 | 左侧栏 `DSH` 面板，多轮上下文，支持提问卡片 |
+| 对话不丢、能翻旧账 | 会话落盘到 `user/default/dsh-agent/`，面板顶部「历史会话」可切换 / 改名 / 移入回收站；重启 ComfyUI 后自动回到上次的会话 |
 | 帮你看报错 | 执行出错时面板顶部出现红色横幅，「让 Agent 分析」一键把节点、异常类型、traceback 发给 agent；agent 也能用 `comfy_get_logs` 读服务端日志 |
 | 理解需求后重排节点 | agent 通过 `comfy_get_graph` 读当前画布，改完后 `comfy_replace_graph` 提交，前端自动应用（可撤销） |
 | 复用你的 DSH 登录 | 走 DSH 官方 SDK 协议（`--profile sdk`），复用 `~/.dsh/.credentials.yaml`，**不需要 API Key** |
 | 复用官方 MCP 通道 | 通过官方 `dsh-mcp-client` 拉起本仓库的 `mcp_server.py`，工具以 `mcp__comfy__comfy_*` 形式暴露 |
+
+## v0.2.0 新增
+
+- **历史会话**：每个会话独立落盘（`index.json` + `sessions/<id>.jsonl`），关面板、重启 ComfyUI 都不丢；「历史会话 ▾」里可切换、改名、移到回收站，回收站里可恢复或彻底删除。多个会话可以同时存在（SDK 的 agent 活到进程退出），切换时会提示"旧会话仍在后台跑，两个一起跑抢显存"。
+- **授权卡**：agent 要提权/sandbox 变更时不再只有一行小字，而是卡片——工具名、callId、理由 + 「允许一次 / 本会话总是允许 / 拒绝」。5 分钟不处理按**拒绝**结束；同会话里发新消息时，挂着的旧授权卡也按**拒绝**收尾（不会因为你说了一句话就顺手放行危险工具）。
+- **询问卡支持自定义**：`ask_user_question` 的卡片除了选项，还能直接填自己的答案。
+- **安全与稳定性**（一轮 5 视角对抗性代码审查后的修复）：所有 `/dsh/*` 路由校验 Host/Origin（只接受 loopback，防 DNS rebinding / CSRF）；`sessionId` 走白名单正则（防路径逃逸）；会话存储加锁、索引原子写 + 损坏自愈（从 `sessions/*.jsonl` 重建）；DSH runtime 崩溃后能重新拉起，在途请求立即失败而不是干等 30–120 秒。
+
+详见 [`docs/PATCH-NOTES-v2.md`](docs/PATCH-NOTES-v2.md)。
 
 ## 架构
 

@@ -22,6 +22,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from dsh_engine import DshError, DshRuntime  # noqa: E402
+from dsh_store import SessionStore  # noqa: E402
 
 try:  # ComfyUI's aiohttp server
     from aiohttp import web
@@ -56,6 +57,7 @@ class BridgeState:
         self.object_info_ts: float = 0.0
         self.engine: DshRuntime | None = None
         self.engine_error: str = ""
+        self.store: SessionStore | None = None
 
     # -- graph ---------------------------------------------------------
 
@@ -116,6 +118,21 @@ def mcp_server_path() -> str:
     return os.path.join(_HERE, "mcp_server.py")
 
 
+def store_dir() -> str:
+    """会话索引与记录的落盘位置：<ComfyUI>/user/default/dsh-agent。"""
+    path = os.path.join(_base_dir(), "user", "default", "dsh-agent")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_store() -> SessionStore:
+    with STATE.lock:
+        if STATE.store is None:
+            STATE.store = SessionStore(store_dir())
+            STATE.store.load()
+        return STATE.store
+
+
 def get_engine() -> DshRuntime:
     with STATE.lock:
         if STATE.engine is None:
@@ -128,6 +145,7 @@ def get_engine() -> DshRuntime:
                 provider=os.environ.get("DSH_COMFY_PROVIDER", "deepseek-account"),
                 model=os.environ.get("DSH_COMFY_MODEL", "deepseek-flash"),
                 reasoning_effort=os.environ.get("DSH_COMFY_EFFORT", "high"),
+                store=get_store(),
             )
         return STATE.engine
 
@@ -274,10 +292,29 @@ def describe_error(error: dict | None) -> str:
 
 routes = PromptServer.instance.routes
 
+# 只接受本机访问：ComfyUI 本身没有鉴权，任何能连到 8188 的网页都能去驱动
+# /dsh/*（关审批、删会话、让 agent 干活）。检查 Host 与 Origin 都在 loopback。
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def _require_local(request) -> None:
+    host = (request.host or "").rsplit(":", 1)[0].strip("[]").lower()
+    if host not in _LOOPBACK:
+        raise web.HTTPForbidden(text="dsh-agent: loopback only")
+    origin = request.headers.get("Origin")
+    if origin:
+        from urllib.parse import urlparse
+
+        ohost = (urlparse(origin).hostname or "").lower()
+        if ohost not in _LOOPBACK:
+            raise web.HTTPForbidden(text="dsh-agent: origin not allowed")
+
 
 @routes.get("/dsh/status")
 async def dsh_status(request):
+    _require_local(request)
     engine = get_engine()
+    sid = (request.query.get("sessionId") or "").strip() or None
     return web.json_response(
         {
             "ok": True,
@@ -286,12 +323,14 @@ async def dsh_status(request):
             "sessionId": engine.session_id,
             "bridge": bridge_url(),
             "hasGraph": STATE.graph is not None,
+            "autoApprove": engine.auto_approve(sid),
         }
     )
 
 
 @routes.post("/dsh/chat")
 async def dsh_chat(request):
+    _require_local(request)
     try:
         body = await request.json()
     except Exception:
@@ -302,9 +341,10 @@ async def dsh_chat(request):
 
     context = f"<comfy_context>\n{describe_graph(STATE.graph, 40)}\n{describe_error(STATE.last_error)}\n</comfy_context>"
     payload = f"{text}\n\n{context}"
+    sid = (body.get("sessionId") or "").strip() or None
     engine = get_engine()
     try:
-        result = await asyncio.to_thread(engine.submit, payload)
+        result = await asyncio.to_thread(engine.submit, payload, sid)
     except DshError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=503)
     except Exception as exc:  # noqa: BLE001
@@ -314,12 +354,14 @@ async def dsh_chat(request):
 
 @routes.get("/dsh/poll")
 async def dsh_poll(request):
+    _require_local(request)
     try:
         cursor = int(request.query.get("cursor", "0"))
     except ValueError:
         cursor = 0
     engine = get_engine()
-    data = engine.poll(cursor)
+    sid = (request.query.get("sessionId") or "").strip() or None
+    data = engine.poll(cursor, sid)
     pending = STATE.take_pending()
     if pending:
         data["pendingGraph"] = {
@@ -334,6 +376,7 @@ async def dsh_poll(request):
 
 @routes.post("/dsh/answer")
 async def dsh_answer(request):
+    _require_local(request)
     body = await request.json()
     request_id = body.get("requestId")
     answers = body.get("answers") or []
@@ -341,14 +384,154 @@ async def dsh_answer(request):
     return web.json_response({"ok": True})
 
 
+@routes.post("/dsh/approve")
+async def dsh_approve(request):
+    _require_local(request)
+    body = await request.json()
+    request_id = (body.get("requestId") or "").strip()
+    outcome = (body.get("outcome") or "").strip()
+    remember = bool(body.get("remember"))
+    if not request_id:
+        return web.json_response({"ok": False, "error": "requestId required"}, status=400)
+    # 必须显式给出结果：缺省不能当成"允许"，否则一次手滑就等于放行。
+    if outcome not in ("allowed-once", "rejected", "cancelled"):
+        return web.json_response({"ok": False, "error": "outcome must be allowed-once/rejected/cancelled"}, status=400)
+    try:
+        result = get_engine().resolve_approval(request_id, outcome, remember=remember)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return web.json_response(result)
+
+
+@routes.post("/dsh/autonomy")
+async def dsh_autonomy(request):
+    """本会话是否自动放行工具授权（等价于卡片上的「本会话总是允许」开关）。"""
+    _require_local(request)
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    sid = (body.get("sessionId") or "").strip() or None
+    return web.json_response(get_engine().set_auto_approve(enabled, sid))
+
+
 @routes.post("/dsh/reset")
 async def dsh_reset(request):
+    _require_local(request)
     with STATE.lock:
         engine = STATE.engine
         STATE.engine = None
     if engine is not None:
         await asyncio.to_thread(engine.stop)
     return web.json_response({"ok": True})
+
+
+# -- 会话管理（历史会话 / 回收站） --------------------------------------------
+
+
+@routes.get("/dsh/sessions")
+async def dsh_sessions(request):
+    _require_local(request)
+    engine = get_engine()
+    data = engine.list_sessions() if engine is not None else []
+    return web.json_response(
+        {
+            "ok": True,
+            "sessions": data,
+            "active": engine.session_id if engine else None,
+            "trash": engine.list_trash() if engine else [],
+        }
+    )
+
+
+@routes.post("/dsh/session/new")
+async def dsh_session_new(request):
+    _require_local(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    engine = get_engine()
+    try:
+        result = await asyncio.to_thread(engine.new_session, body.get("title"))
+    except DshError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=503)
+    return web.json_response({"ok": True, **result})
+
+
+@routes.post("/dsh/session/select")
+async def dsh_session_select(request):
+    _require_local(request)
+    body = await request.json()
+    sid = (body.get("sessionId") or "").strip()
+    if not sid:
+        return web.json_response({"ok": False, "error": "sessionId required"}, status=400)
+    engine = get_engine()
+    try:
+        result = await asyncio.to_thread(engine.activate, sid)
+    except DshError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=503)
+    return web.json_response({"ok": True, **result})
+
+
+@routes.post("/dsh/session/rename")
+async def dsh_session_rename(request):
+    _require_local(request)
+    body = await request.json()
+    sid = (body.get("sessionId") or "").strip()
+    title = (body.get("title") or "").strip()
+    if not sid or not title:
+        return web.json_response({"ok": False, "error": "sessionId and title required"}, status=400)
+    engine = get_engine()
+    row = await asyncio.to_thread(engine.rename_session, sid, title)
+    if not row:
+        return web.json_response({"ok": False, "error": "no such session"}, status=404)
+    return web.json_response({"ok": True, "session": row})
+
+
+@routes.post("/dsh/session/trash")
+async def dsh_session_trash(request):
+    _require_local(request)
+    body = await request.json()
+    sid = (body.get("sessionId") or "").strip()
+    if not sid:
+        return web.json_response({"ok": False, "error": "sessionId required"}, status=400)
+    engine = get_engine()
+    result = await asyncio.to_thread(engine.trash_session, sid)
+    return web.json_response({"ok": True, **result})
+
+
+@routes.post("/dsh/session/restore")
+async def dsh_session_restore(request):
+    _require_local(request)
+    body = await request.json()
+    sid = (body.get("sessionId") or "").strip()
+    if not sid:
+        return web.json_response({"ok": False, "error": "sessionId required"}, status=400)
+    engine = get_engine()
+    result = await asyncio.to_thread(engine.restore_session, sid)
+    return web.json_response({"ok": True, **result})
+
+
+@routes.post("/dsh/session/purge")
+async def dsh_session_purge(request):
+    _require_local(request)
+    body = await request.json()
+    sid = (body.get("sessionId") or "").strip()
+    engine = get_engine()
+    # 清空回收站必须显式说 all=true：缺 sessionId 不能等同于"全删"。
+    if body.get("all") is True and not sid:
+        rows = engine.list_trash()
+        done = 0
+        for row in rows:
+            if (await asyncio.to_thread(engine.purge_session, row["sessionId"])).get("ok"):
+                done += 1
+        return web.json_response({"ok": True, "purged": done})
+    if not sid:
+        return web.json_response({"ok": False, "error": "sessionId required"}, status=400)
+    try:
+        result = await asyncio.to_thread(engine.purge_session, sid)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return web.json_response({"ok": True, **result})
 
 
 @routes.get("/dsh/graph")
@@ -358,6 +541,7 @@ async def dsh_graph(request):
 
 @routes.post("/dsh/graph")
 async def dsh_set_graph(request):
+    _require_local(request)
     body = await request.json()
     graph = body.get("graph")
     if not isinstance(graph, dict):
@@ -368,6 +552,7 @@ async def dsh_set_graph(request):
 
 @routes.post("/dsh/error")
 async def dsh_error(request):
+    _require_local(request)
     body = await request.json()
     body["ts"] = time.time()
     STATE.set_error(body)
@@ -376,6 +561,7 @@ async def dsh_error(request):
 
 @routes.post("/dsh/selection")
 async def dsh_selection(request):
+    _require_local(request)
     body = await request.json()
     STATE.selected = body.get("nodes") or []
     return web.json_response({"ok": True})
@@ -383,6 +569,7 @@ async def dsh_selection(request):
 
 @routes.post("/dsh/pending")
 async def dsh_pending_post(request):
+    _require_local(request)
     body = await request.json()
     graph = body.get("graph")
     if not isinstance(graph, dict) or "nodes" not in graph:
@@ -393,6 +580,7 @@ async def dsh_pending_post(request):
 
 @routes.post("/dsh/pending/ack")
 async def dsh_pending_ack(request):
+    _require_local(request)
     body = await request.json()
     with STATE.lock:
         if STATE.pending and STATE.pending.get("id") == body.get("id"):
@@ -403,6 +591,7 @@ async def dsh_pending_ack(request):
 
 @routes.get("/dsh/state")
 async def dsh_state(request):
+    _require_local(request)
     lines: list[str] = []
     lines.append("== 画布 ==")
     lines.append(describe_graph(STATE.graph, 60))
@@ -439,6 +628,7 @@ async def dsh_state(request):
 
 @routes.get("/dsh/logs")
 async def dsh_logs(request):
+    _require_local(request)
     try:
         lines = int(request.query.get("lines", "120"))
     except ValueError:
@@ -483,6 +673,7 @@ async def dsh_node_info(request):
 
 @routes.get("/dsh/debug")
 async def dsh_debug(request):
+    _require_local(request)
     engine = get_engine()
     return web.json_response(
         {

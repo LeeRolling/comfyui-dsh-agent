@@ -32,6 +32,10 @@ const S = {
   statusEl: null,
   lastAssistantEl: null,
   toolChips: new Map(),
+  activeSession: "",
+  sessions: [],
+  trash: [],
+  menuEl: null,
 };
 
 const MAX_MESSAGES = 200;
@@ -162,43 +166,134 @@ function updateErrorBanner() {
   }
 }
 
+function markCardClosed(requestId, note) {
+  // 不把 requestId 拼进选择器：服务端给的 id 含引号时会抛 SyntaxError，
+  // 进而吞掉整批事件。直接按 dataset 比对更稳。
+  const cards = S.messages ? Array.from(S.messages.children).filter((n) => n.dataset && n.dataset.req === requestId) : [];
+  cards.forEach((card) => {
+    card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    card.querySelectorAll("input").forEach((i) => (i.disabled = true));
+    card.classList.add("dsh-card-closed");
+    if (note) {
+      const tag = el("div", "dsh-card-note", note);
+      card.appendChild(tag);
+    }
+  });
+}
+
+function addApproval(ev) {
+  if (!S.messages) return;
+  const card = el("div", "dsh-approval");
+  card.dataset.req = ev.requestId;
+  card.appendChild(el("div", "dsh-q-title", "Agent 想运行一个工具："));
+  const head = el("div", "dsh-approval-tool");
+  head.appendChild(el("span", "dsh-tool-name", ev.toolName || "tool"));
+  if (ev.callId) head.appendChild(el("span", "dsh-tool-callid", ev.callId.slice(0, 8)));
+  card.appendChild(head);
+  if (ev.reason) card.appendChild(el("div", "dsh-q-text", ev.reason));
+
+  const decide = async (outcome, remember) => {
+    card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    const res = await postJSON("/dsh/approve", {
+      requestId: ev.requestId,
+      outcome,
+      remember: !!remember,
+    });
+    const label =
+      outcome === "allowed-once"
+        ? remember
+          ? "已允许，且本会话后续都放行"
+          : "已允许这一次"
+        : "已拒绝";
+    card.appendChild(el("div", "dsh-q-picked", res && res.ok ? label : "这张卡已失效"));
+  };
+
+  const wrap = el("div", "dsh-q-options");
+  const ok = el("button", "dsh-q-opt dsh-approve", "允许一次");
+  ok.onclick = () => decide("allowed-once", false);
+  const always = el("button", "dsh-q-opt", "本会话总是允许");
+  always.title = "之后这个会话里的工具调用都不再问";
+  always.onclick = () => decide("allowed-once", true);
+  const no = el("button", "dsh-q-opt dsh-reject", "拒绝");
+  no.onclick = () => decide("rejected", false);
+  wrap.appendChild(ok);
+  wrap.appendChild(always);
+  wrap.appendChild(no);
+  card.appendChild(wrap);
+  S.messages.appendChild(card);
+  S.messages.scrollTop = S.messages.scrollHeight;
+}
+
 function addQuestion(ev) {
   if (!S.messages) return;
   const questions = ev.questions || [];
   const card = el("div", "dsh-question");
+  card.dataset.req = ev.requestId;
   card.appendChild(el("div", "dsh-q-title", "Agent 需要你确认："));
   const answers = [];
   let remaining = questions.length;
   const sendIfDone = async () => {
     if (remaining > 0) return;
     card.querySelectorAll("button").forEach((b) => (b.disabled = true));
-    await postJSON("/dsh/answer", { requestId: ev.requestId, answers });
+    const res = await postJSON("/dsh/answer", { requestId: ev.requestId, answers });
+    if (res && !res.ok) card.appendChild(el("div", "dsh-q-picked", "提交失败：卡片可能已过期"));
   };
   questions.forEach((q) => {
     const block = el("div", "dsh-q-block");
     if (q.header) block.appendChild(el("div", "dsh-q-header", q.header));
     block.appendChild(el("div", "dsh-q-text", q.question || ""));
-    const options = q.options && q.options.length ? q.options : [{ label: "继续" }];
+    const options = q.options && q.options.length ? q.options : [];
     const optWrap = el("div", "dsh-q-options");
     const answer = { id: q.id, selected: [] };
     answers.push(answer);
     let picked = false;
+    const settle = async (label) => {
+      picked = true;
+      block.querySelectorAll("button").forEach((b) => (b.disabled = true));
+      const input = block.querySelector(".dsh-q-custom");
+      if (input) input.disabled = true;
+      block.appendChild(el("div", "dsh-q-picked", `已答：${label}`));
+      remaining -= 1;
+      await sendIfDone();
+    };
     options.forEach((opt) => {
       const btn = el("button", "dsh-q-opt", opt.label);
       if (opt.description) btn.title = opt.description;
       btn.onclick = async () => {
         if (picked) return;
-        picked = true;
         answer.selected = [opt.label];
-        btn.classList.add("dsh-picked");
-        optWrap.querySelectorAll("button").forEach((b) => (b.disabled = true));
-        block.appendChild(el("div", "dsh-q-picked", `已选择：${opt.label}`));
-        remaining -= 1;
-        await sendIfDone();
+        await settle(opt.label);
       };
       optWrap.appendChild(btn);
     });
-    block.appendChild(optWrap);
+    if (options.length) block.appendChild(optWrap);
+
+    // 自定义回答：协议允许 selected 为空 + custom 文本
+    const customWrap = el("div", "dsh-q-custom-wrap");
+    const input = el("input", "dsh-q-custom");
+    input.placeholder = options.length ? "也可以自己写一个答案…" : "输入你的回答…";
+    input.type = "text";
+    const submit = el("button", "dsh-q-opt dsh-q-custom-btn", "提交");
+    submit.onclick = async () => {
+      if (picked) return;
+      const text = (input.value || "").trim();
+      if (!text) {
+        input.focus();
+        return;
+      }
+      answer.selected = [];
+      answer.custom = text;
+      await settle(text);
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submit.click();
+      }
+    });
+    customWrap.appendChild(input);
+    customWrap.appendChild(submit);
+    block.appendChild(customWrap);
     card.appendChild(block);
   });
   S.messages.appendChild(card);
@@ -224,6 +319,8 @@ async function applyPendingGraph(pending) {
     }
   } catch (err) {
     addMessage("error", `加载 Agent 提交的画布失败：${err}`);
+    // 失败的图也要 ack：否则服务端每 700ms 重投同一份坏图，消息区会被刷屏。
+    await postJSON("/dsh/pending/ack", { id: pending.id }).catch(() => {});
   }
 }
 
@@ -231,6 +328,9 @@ async function applyPendingGraph(pending) {
 
 function handleEvent(ev) {
   switch (ev.kind) {
+    case "user":
+      if (ev.text && ev.text.trim()) addMessage("user", ev.text);
+      break;
     case "assistant":
       if (ev.text && ev.text.trim()) addMessage("assistant", ev.text);
       break;
@@ -248,6 +348,15 @@ function handleEvent(ev) {
       break;
     case "question":
       addQuestion(ev);
+      break;
+    case "question_closed":
+      markCardClosed(ev.requestId, "这张卡已失效");
+      break;
+    case "approval":
+      addApproval(ev);
+      break;
+    case "approval_closed":
+      markCardClosed(ev.requestId, ev.text || (ev.outcome === "rejected" ? "已拒绝" : "已处理"));
       break;
     case "ready":
       addMessage("system", `DeepSeek Harness 已连接（${ev.text || "deepseek"}）`);
@@ -268,8 +377,15 @@ function handleEvent(ev) {
 }
 
 async function pollOnce() {
+  // 一次只允许一个在途请求：慢响应叠加快轮询会让游标来回跳。
+  if (S.pollInFlight) return;
+  const reqSid = S.activeSession || "";
+  S.pollInFlight = true;
   try {
-    const data = await getJSON(`/dsh/poll?cursor=${S.cursor}`);
+    const sid = reqSid ? `&sessionId=${encodeURIComponent(reqSid)}` : "";
+    const data = await getJSON(`/dsh/poll?cursor=${S.cursor}${sid}`);
+    // 请求期间用户切了会话：这份响应属于旧会话，丢弃，别把游标/消息串过去。
+    if ((S.activeSession || "") !== reqSid) return;
     S.cursor = data.cursor ?? S.cursor;
     S.engine = data.status || S.engine;
     S.running = !!data.running;
@@ -288,11 +404,15 @@ async function pollOnce() {
     }
   } catch {
     /* ComfyUI may be reloading; ignore */
+  } finally {
+    S.pollInFlight = false;
   }
 }
 
 function startPolling() {
-  if (S.pollTimer) return;
+  if (S.pollTimer) {
+    clearInterval(S.pollTimer);
+  }
   S.pollTimer = setInterval(pollOnce, 700);
   pollOnce();
 }
@@ -329,12 +449,257 @@ function sendCurrent() {
   input.style.height = "";
   addMessage("user", text);
   setThinking(true);
-  postJSON("/dsh/chat", { text }).then((data) => {
+  postJSON("/dsh/chat", { text, sessionId: S.activeSession || undefined }).then((data) => {
     if (!data.ok) {
       setThinking(false);
       addMessage("error", data.error || "发送失败");
     }
   });
+}
+
+// ---------------------------------------------------------------- sessions
+
+function relTime(ts) {
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - (ts || 0)));
+  if (sec < 60) return "刚刚";
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  if (sec < 86400 * 30) return `${Math.floor(sec / 86400)} 天前`;
+  return new Date((ts || 0) * 1000).toLocaleDateString();
+}
+
+function closeHistoryMenu() {
+  if (S.menuEl) {
+    S.menuEl.remove();
+    S.menuEl = null;
+  }
+}
+
+function menuStyle() {
+  return [
+    "position:absolute",
+    "left:10px",
+    "top:46px",
+    "z-index:80",
+    "min-width:280px",
+    "max-width:360px",
+    "max-height:62vh",
+    "overflow:auto",
+    "background:#202027",
+    "border:1px solid #3b3b46",
+    "border-radius:10px",
+    "box-shadow:0 10px 28px rgba(0,0,0,.5)",
+    "padding:6px",
+    "font-size:12px",
+    "color:#dcdce4",
+  ].join(";");
+}
+
+function menuRow(active) {
+  const row = el("div", "dsh-menu-row");
+  row.style.cssText = [
+    "display:flex",
+    "align-items:center",
+    "gap:6px",
+    "padding:7px 8px",
+    "border-radius:7px",
+    "cursor:pointer",
+    active ? "background:#2c2c38" : "",
+  ].join(";");
+  row.onmouseenter = () => (row.style.background = "#2c2c38");
+  row.onmouseleave = () => (row.style.background = active ? "#2c2c38" : "transparent");
+  return row;
+}
+
+function openHistoryMenu(anchor) {
+  if (S.menuEl) {
+    closeHistoryMenu();
+    return;
+  }
+  const root = S.root;
+  if (root) root.style.position = "relative";
+  const menu = el("div", "dsh-menu");
+  menu.style.cssText = menuStyle();
+
+  const head = el("div", "", "历史会话");
+  head.style.cssText = "padding:6px 8px;font-weight:600;opacity:.85";
+  menu.appendChild(head);
+
+  if (!S.sessions.length) {
+    const empty = el("div", "", "（还没有别的会话）");
+    empty.style.cssText = "padding:6px 8px;opacity:.6";
+    menu.appendChild(empty);
+  }
+
+  for (const item of S.sessions) {
+    const active = item.sessionId === S.activeSession;
+    const row = menuRow(active);
+    const label = el("div", "", `${active ? "● " : ""}${item.title || "未命名"}`);
+    label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+    const meta = el("div", "", `${item.count || 0} 条 · ${relTime(item.updatedAt)}`);
+    meta.style.cssText = "opacity:.55;font-size:11px;margin-top:2px";
+    const textWrap = el("div", "");
+    textWrap.style.cssText = "flex:1;min-width:0";
+    textWrap.appendChild(label);
+    textWrap.appendChild(meta);
+    textWrap.onclick = () => switchSession(item);
+    row.appendChild(textWrap);
+
+    const rename = el("button", "dsh-mini", "✎");
+    rename.title = "改名";
+    rename.style.cssText = "background:none;border:none;color:#bbb;cursor:pointer;font-size:13px";
+    rename.onclick = async (e) => {
+      e.stopPropagation();
+      const next = prompt("给这个会话起个名字：", item.title || "");
+      if (!next || !next.trim()) return;
+      await postJSON("/dsh/session/rename", { sessionId: item.sessionId, title: next.trim() });
+      await refreshSessions();
+      closeHistoryMenu();
+      openHistoryMenu();
+    };
+    row.appendChild(rename);
+
+    const del = el("button", "dsh-mini", "🗑");
+    del.title = "移到回收站";
+    del.style.cssText = "background:none;border:none;color:#bbb;cursor:pointer;font-size:12px";
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`把「${item.title || "未命名"}」移到回收站？之后可以从回收站恢复。`)) return;
+      const res = await postJSON("/dsh/session/trash", { sessionId: item.sessionId });
+      await refreshSessions();
+      closeHistoryMenu();
+      if (res.next) await switchSession({ sessionId: res.next, title: "" }, true);
+      else openHistoryMenu();
+    };
+    row.appendChild(del);
+    menu.appendChild(row);
+  }
+
+  const sep = el("div", "");
+  sep.style.cssText = "height:1px;background:#34343d;margin:6px 4px";
+  menu.appendChild(sep);
+
+  const trashBtn = el("div", "", `回收站 (${S.trash.length}) ›`);
+  trashBtn.style.cssText = "padding:6px 8px;cursor:pointer;opacity:.85";
+  trashBtn.onclick = () => openTrashMenu();
+  menu.appendChild(trashBtn);
+
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  (S.root || document.body).appendChild(menu);
+  S.menuEl = menu;
+}
+
+function openTrashMenu() {
+  closeHistoryMenu();
+  const menu = el("div", "dsh-menu");
+  menu.style.cssText = menuStyle();
+  const head = el("div", "", `回收站（${S.trash.length}）`);
+  head.style.cssText = "padding:6px 8px;font-weight:600;opacity:.85";
+  menu.appendChild(head);
+
+  if (!S.trash.length) {
+    const empty = el("div", "", "（空的）");
+    empty.style.cssText = "padding:6px 8px;opacity:.6";
+    menu.appendChild(empty);
+  }
+  for (const item of S.trash) {
+    const row = menuRow(false);
+    const label = el("div", "", item.title || "未命名");
+    label.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+    row.appendChild(label);
+    const back = el("button", "", "恢复");
+    back.style.cssText = "background:#2f3a33;border:1px solid #3f5247;color:#bcd;border-radius:6px;padding:2px 8px;cursor:pointer";
+    back.onclick = async (e) => {
+      e.stopPropagation();
+      await postJSON("/dsh/session/restore", { sessionId: item.sessionId });
+      await refreshSessions();
+      openTrashMenu();
+    };
+    row.appendChild(back);
+    const purge = el("button", "", "彻底删除");
+    purge.style.cssText = "background:#3a2a2a;border:1px solid #5a3a3a;color:#f0b8b8;border-radius:6px;padding:2px 8px;cursor:pointer";
+    purge.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("彻底删除后无法恢复，确定？")) return;
+      await postJSON("/dsh/session/purge", { sessionId: item.sessionId });
+      await refreshSessions();
+      openTrashMenu();
+    };
+    row.appendChild(purge);
+    menu.appendChild(row);
+  }
+
+  if (S.trash.length) {
+    const sep = el("div", "");
+    sep.style.cssText = "height:1px;background:#34343d;margin:6px 4px";
+    menu.appendChild(sep);
+    const clear = el("div", "", "清空回收站");
+    clear.style.cssText = "padding:6px 8px;cursor:pointer;color:#f0b8b8";
+    clear.onclick = async () => {
+      if (!confirm("清空回收站？所有条目会被彻底删除，无法恢复。")) return;
+      await postJSON("/dsh/session/purge", { sessionId: "__all__" });
+      await refreshSessions();
+      closeHistoryMenu();
+    };
+    menu.appendChild(clear);
+  }
+
+  const back = el("div", "", "‹ 返回会话列表");
+  back.style.cssText = "padding:6px 8px;cursor:pointer;opacity:.7";
+  back.onclick = () => {
+    closeHistoryMenu();
+    openHistoryMenu();
+  };
+  menu.appendChild(back);
+
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  (S.root || document.body).appendChild(menu);
+  S.menuEl = menu;
+}
+
+async function refreshSessions() {
+  try {
+    const data = await getJSON("/dsh/sessions");
+    S.sessions = data.sessions || [];
+    S.trash = data.trash || [];
+    // 只在还没选中会话时采纳服务端的 active：否则后台的一次切换会
+    // 把用户正看着的会话指针拽走（列表高亮与视图对不上）。
+    if (!S.activeSession && data.active) S.activeSession = data.active;
+    if (S.historyBtn) {
+      S.historyBtn.textContent = `历史会话 (${S.sessions.length}) ▾`;
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function switchSession(item, silent = false) {
+  closeHistoryMenu();
+  if (!item || !item.sessionId) return;
+  if (item.sessionId === S.activeSession) return;
+  if (!silent) {
+    const ok = confirm(
+      "切换到另一个会话？\n\n" +
+        "旧会话如果还在跑任务，它会继续在后台跑完（不会中断），但两个会话同时跑会一起吃显存和速度。\n" +
+        "机器扛得住就继续，扛不住可以先等它跑完。"
+    );
+    if (!ok) return;
+  }
+  const res = await postJSON("/dsh/session/select", { sessionId: item.sessionId });
+  if (!res.ok) {
+    alert(res.error || "切换失败");
+    return;
+  }
+  S.activeSession = res.sessionId || item.sessionId;
+  S.cursor = 0;
+  S.toolChips.clear();
+  S.lastGraphKey = "";
+  if (S.messages) {
+    S.messages.innerHTML = "";
+    addMessage("system", `已切换到「${item.title || "会话"}」。`);
+  }
+  await refreshSessions();
+  pollOnce();
 }
 
 function buildPanel(root) {
@@ -351,6 +716,7 @@ function buildPanel(root) {
     }
     S.root = root;
     startGraphSync();
+    refreshSessions();
     startPolling();
     if (S.messages) S.messages.scrollTop = S.messages.scrollHeight;
     return;
@@ -366,18 +732,30 @@ function buildPanel(root) {
   statusWrap.appendChild(S.statusEl);
 
   const actions = el("div", "dsh-actions");
+  S.historyBtn = el("button", "dsh-icon-btn", "历史会话 ▾");
+  S.historyBtn.title = "切换历史会话 / 回收站";
+  S.historyBtn.onclick = (e) => {
+    e.stopPropagation();
+    openHistoryMenu(S.historyBtn);
+  };
   const newChat = el("button", "dsh-icon-btn", "新对话");
-  newChat.title = "结束当前对话并开启新会话";
+  newChat.title = "开一个新会话（旧会话保留在历史里）";
   newChat.onclick = async () => {
-    if (!confirm("开启新的对话？当前对话上下文会被清空。")) return;
-    await postJSON("/dsh/reset", {});
+    const res = await postJSON("/dsh/session/new", {});
+    if (!res.ok) {
+      addMessage("error", res.error || "新建会话失败");
+      return;
+    }
+    S.activeSession = res.sessionId;
     S.cursor = 0;
     S.lastGraphKey = "";
     S.toolChips.clear();
     if (S.messages) S.messages.innerHTML = "";
     addMessage("system", "已开启新对话。");
+    await refreshSessions();
     pollOnce();
   };
+  actions.appendChild(S.historyBtn);
   actions.appendChild(newChat);
   header.appendChild(title);
   header.appendChild(statusWrap);
@@ -435,11 +813,14 @@ function buildPanel(root) {
   S.panelKids = Array.from(root.childNodes);
 
   startGraphSync();
+  refreshSessions();
+  document.addEventListener("click", () => closeHistoryMenu());
   // Resume from the cursor we already hold. Resetting it to the newest event
   // (-1) silently skipped whatever the agent finished while the tab was shut.
   getJSON(`/dsh/poll?cursor=${S.cursor}`)
     .then((d) => {
       S.cursor = d.cursor ?? S.cursor;
+      if (d.sessionId) S.activeSession = d.sessionId;
     })
     .catch(() => {})
     .finally(() => startPolling());
